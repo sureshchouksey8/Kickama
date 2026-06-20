@@ -35,6 +35,9 @@ python3 tools/terraform_import.py --csv imports.csv --plan-summary import-plan.t
 CSV rows may include `type,name,id,state_file` or an explicit
 `address`/`terraform_address` for module resources. Secret-looking import IDs,
 tokens, passwords, access keys, and client secrets are redacted in summaries.
+When the referenced local state file exists under `--state-dir`, the summary
+marks matching root or module addresses as already imported without shelling out
+to Terraform.
 
 ## Monitoring
 

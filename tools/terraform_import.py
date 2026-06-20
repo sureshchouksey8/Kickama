@@ -324,6 +324,26 @@ class TerraformImporter:
         logger.info(f"Import plan summary written to {output_file}")
         return rendered
 
+    def list_resources_from_state_files(self, resources: List[ResourceToImport]) -> List[str]:
+        addresses = set()
+        for state_file in sorted({resource.state_file for resource in resources}):
+            state_path = self.state_dir / state_file
+            if not state_path.exists():
+                continue
+            try:
+                with open(state_path, "r") as f:
+                    state = json.load(f)
+            except (OSError, json.JSONDecodeError) as e:
+                logger.warning(f"Could not read Terraform state file {state_path}: {e}")
+                continue
+
+            for resource in state.get("resources", []):
+                address = terraform_state_resource_address(resource)
+                if address:
+                    addresses.add(address)
+
+        return sorted(addresses)
+
     @staticmethod
     def _resource_address(resource: ResourceToImport) -> str:
         return resource.terraform_address or f"{resource.resource_type}.{resource.resource_name}"
@@ -532,6 +552,19 @@ def render_plan_summary_text(summary: List[Dict[str, Any]]) -> str:
     return "\n".join(lines) + "\n"
 
 
+def terraform_state_resource_address(resource: Dict[str, Any]) -> str:
+    resource_type = resource.get("type")
+    name = resource.get("name")
+    if not resource_type or not name:
+        return ""
+
+    prefix = resource.get("module", "")
+    address = f"{resource_type}.{name}"
+    if prefix:
+        return f"{prefix}.{address}"
+    return address
+
+
 def load_resources_from_csv(path: str) -> List[ResourceToImport]:
     resources_to_import = []
     with open(path, "r") as f:
@@ -608,11 +641,14 @@ def main():
         logger.info(f"Loaded {len(resources_to_import)} resources from {args.csv}")
 
         if args.plan_summary:
+            state_resources = importer.list_resources_from_state_files(resources_to_import)
+            if not state_resources and terraform_required:
+                state_resources = None
             importer.write_import_plan_summary(
                 resources_to_import,
                 args.plan_summary,
                 output_format=args.format,
-                state_resources=[] if not terraform_required else None,
+                state_resources=state_resources,
             )
             if not args.generate_script and args.dry_run:
                 return 0

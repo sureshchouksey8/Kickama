@@ -9,6 +9,7 @@ from terraform_import import (
     TerraformImporter,
     load_resources_from_csv,
     redact_secret_value,
+    terraform_state_resource_address,
 )
 
 
@@ -59,19 +60,32 @@ class TerraformImportPlanSummaryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             csv_path = Path(tmpdir) / "imports.csv"
             out_path = Path(tmpdir) / "summary.json"
+            state_path = Path(tmpdir) / "custom.tfstate"
             csv_path.write_text(
                 "type,name,id,address,state_file\n"
                 "aws_s3_bucket,logs,bucket-prod-logs,,custom.tfstate\n"
                 "aws_iam_role,admin,AKIAIOSFODNN7EXAMPLE,module.iam.aws_iam_role.admin,custom.tfstate\n",
                 encoding="utf-8",
             )
+            state_path.write_text(json.dumps({
+                "resources": [
+                    {"mode": "managed", "type": "aws_s3_bucket", "name": "logs"},
+                    {
+                        "module": "module.iam",
+                        "mode": "managed",
+                        "type": "aws_iam_role",
+                        "name": "admin",
+                    },
+                ]
+            }), encoding="utf-8")
 
             resources = load_resources_from_csv(str(csv_path))
-            rendered = TerraformImporter().write_import_plan_summary(
+            importer = TerraformImporter(state_dir=tmpdir)
+            rendered = importer.write_import_plan_summary(
                 resources,
                 str(out_path),
                 output_format="json",
-                state_resources=[],
+                state_resources=importer.list_resources_from_state_files(resources),
             )
 
             self.assertEqual(out_path.read_text(encoding="utf-8"), rendered)
@@ -81,6 +95,22 @@ class TerraformImportPlanSummaryTest(unittest.TestCase):
                 "module.iam.aws_iam_role.admin",
             ])
             self.assertEqual(data[1]["import_id"], "AKIA...MPLE<redacted>")
+            self.assertTrue(data[0]["already_imported"])
+            self.assertTrue(data[1]["already_imported"])
+
+    def test_terraform_state_resource_address_handles_modules(self):
+        self.assertEqual(
+            terraform_state_resource_address({
+                "module": "module.network",
+                "type": "aws_security_group",
+                "name": "web",
+            }),
+            "module.network.aws_security_group.web",
+        )
+        self.assertEqual(
+            terraform_state_resource_address({"type": "aws_subnet", "name": "private"}),
+            "aws_subnet.private",
+        )
 
 
 if __name__ == "__main__":

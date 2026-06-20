@@ -284,9 +284,11 @@ To verify cleanup behavior without external services:
 tests/check-ai-pipeline-cleanup.sh
 ```
 
-The cleanup test creates a temporary file and a managed child process, runs the
-same cleanup routine used by the signal traps, and fails if either artifact
-survives.
+The direct cleanup test creates a temporary file and a managed child process,
+runs the same cleanup routine used by the signal traps, and fails if either
+artifact survives. The shell test also starts a long-running cleanup harness,
+sends it `TERM`, and verifies the signal path removes the temporary workspace
+and stops the managed child process.
 
 ### Security Scanning
 

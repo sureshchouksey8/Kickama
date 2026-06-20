@@ -15,6 +15,7 @@
 #   ./ai_pipeline.sh --mode deploy       # Deploy to production
 #   ./ai_pipeline.sh --dry-run           # Show what would be done
 #   ./ai_pipeline.sh --watch-gpu         # Monitor GPU usage during training
+#   ./ai_pipeline.sh --cleanup-test      # Verify cleanup without services
 #
 # Requirements:
 #   - Python 3.8+ with torch, transformers, numpy
@@ -266,6 +267,32 @@ run_cleanup_test() {
     fi
 
     echo "cleanup test passed: temporary files removed and child process terminated"
+}
+
+run_cleanup_signal_test() {
+    create_directories
+    touch "$LOG_FILE"
+    setup_cleanup_traps
+    init_temp_workspace
+
+    local test_file="$PIPELINE_TEMP_DIR/cleanup-signal-test.tmp"
+    printf 'temporary signal cleanup test\n' > "$test_file"
+
+    sleep 300 &
+    local test_child=$!
+    register_child_pid "$test_child"
+
+    if [ -n "${AI_PIPELINE_CLEANUP_TEST_TEMP_RECORD:-}" ]; then
+        printf '%s\n' "$PIPELINE_TEMP_DIR" > "$AI_PIPELINE_CLEANUP_TEST_TEMP_RECORD"
+    fi
+    if [ -n "${AI_PIPELINE_CLEANUP_TEST_CHILD_RECORD:-}" ]; then
+        printf '%s\n' "$test_child" > "$AI_PIPELINE_CLEANUP_TEST_CHILD_RECORD"
+    fi
+    if [ -n "${AI_PIPELINE_CLEANUP_SIGNAL_READY:-}" ]; then
+        : > "$AI_PIPELINE_CLEANUP_SIGNAL_READY"
+    fi
+
+    wait "$test_child"
 }
 
 # ---------------------------------------------------------------------------
@@ -593,6 +620,7 @@ MODE="full"
 DRY_RUN=false
 WATCH_GPU=false
 CLEANUP_TEST=false
+CLEANUP_SIGNAL_TEST=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -612,6 +640,10 @@ while [[ $# -gt 0 ]]; do
             CLEANUP_TEST=true
             shift
             ;;
+        --cleanup-signal-test)
+            CLEANUP_SIGNAL_TEST=true
+            shift
+            ;;
         --help|-h)
             head -50 "$0" | grep -E "^#" | sed 's/^# \?//'
             exit 0
@@ -624,7 +656,9 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [ "$CLEANUP_TEST" = true ]; then
+if [ "$CLEANUP_SIGNAL_TEST" = true ]; then
+    run_cleanup_signal_test
+elif [ "$CLEANUP_TEST" = true ]; then
     run_cleanup_test
 else
     main "$MODE" "$DRY_RUN" "$WATCH_GPU"

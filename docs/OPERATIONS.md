@@ -265,6 +265,28 @@ Audit logs are retained for 365 days and include:
 - All deployment events
 - All backup and restore operations
 
+### AI Pipeline Cleanup
+
+`ai_pipeline.sh` installs cleanup traps for `INT`, `TERM`, and normal `EXIT`.
+The pipeline keeps the run log under `logs/` and final evaluation artifacts
+under `metrics/`, but transient scratch files are created in a per-run
+temporary workspace under `${TMPDIR:-/tmp}` and removed before the script exits.
+
+Background child processes started by the script, including GPU monitoring and
+simulated long-running pipeline steps, are tracked and terminated during
+cleanup so interrupted local runs do not leave stale `sleep`, monitor, or
+scratch processes behind.
+
+To verify cleanup behavior without external services:
+
+```bash
+./ai_pipeline.sh --cleanup-test
+```
+
+The cleanup test creates a temporary file and a managed child process, runs the
+same cleanup routine used by the signal traps, and fails if either artifact
+survives.
+
 ### Security Scanning
 
 | Scan Type | Frequency | Tool |

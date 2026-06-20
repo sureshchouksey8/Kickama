@@ -65,6 +65,14 @@ NC='\033[0m' # No Color
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 LOG_FILE="$PROJECT_ROOT/logs/ai_pipeline_${TIMESTAMP}.log"
 
+# Cleanup state. Logs and final metrics are intentionally retained; transient
+# scratch files and managed background children are removed on normal exit,
+# Ctrl-C, and TERM.
+PIPELINE_TEMP_DIR=""
+PIPELINE_TEMP_PATHS=()
+PIPELINE_CHILD_PIDS=()
+PIPELINE_CLEANED_UP=false
+
 # ---------------------------------------------------------------------------
 # Utility Functions
 # ---------------------------------------------------------------------------
@@ -88,6 +96,136 @@ log() {
     echo "[${TIMESTAMP}] [${level}] ${message}" >> "$LOG_FILE"
 }
 
+register_temp_path() {
+    local path="${1:-}"
+    if [ -n "$path" ]; then
+        PIPELINE_TEMP_PATHS+=("$path")
+    fi
+}
+
+register_child_pid() {
+    local pid="${1:-}"
+    if [ -n "$pid" ]; then
+        PIPELINE_CHILD_PIDS+=("$pid")
+    fi
+}
+
+unregister_child_pid() {
+    local pid="${1:-}"
+    local remaining=()
+    local child
+    local registered_children=()
+    set +u
+    registered_children=("${PIPELINE_CHILD_PIDS[@]}")
+    set -u
+    set +u
+    for child in "${registered_children[@]}"; do
+        if [ "$child" != "$pid" ]; then
+            remaining+=("$child")
+        fi
+    done
+    set -u
+    PIPELINE_CHILD_PIDS=("${remaining[@]}")
+}
+
+cleanup_child_processes() {
+    local seen=" "
+    local child
+    local registered_children=()
+    set +u
+    registered_children=("${PIPELINE_CHILD_PIDS[@]}")
+    set -u
+    set +u
+    for child in "${registered_children[@]}" $(jobs -pr 2>/dev/null || true); do
+        if [ -z "${child:-}" ] || [[ "$seen" == *" $child "* ]]; then
+            continue
+        fi
+        seen="${seen}${child} "
+        if kill -0 "$child" 2>/dev/null; then
+            kill "$child" 2>/dev/null || true
+        fi
+    done
+
+    for child in "${registered_children[@]}" $(jobs -pr 2>/dev/null || true); do
+        if [ -n "${child:-}" ]; then
+            wait "$child" 2>/dev/null || true
+        fi
+    done
+    set -u
+    PIPELINE_CHILD_PIDS=()
+}
+
+cleanup_temp_paths() {
+    local path
+    local registered_paths=()
+    set +u
+    registered_paths=("${PIPELINE_TEMP_PATHS[@]}")
+    set -u
+    set +u
+    for path in "${registered_paths[@]}"; do
+        if [ -n "$path" ] && [ -e "$path" ]; then
+            rm -rf -- "$path"
+        fi
+    done
+    set -u
+    PIPELINE_TEMP_PATHS=()
+}
+
+cleanup_resources() {
+    local reason="${1:-exit}"
+    if [ "$PIPELINE_CLEANED_UP" = true ]; then
+        return 0
+    fi
+    PIPELINE_CLEANED_UP=true
+
+    cleanup_child_processes
+    cleanup_temp_paths
+
+    if [ -f "$LOG_FILE" ]; then
+        log "INFO" "Cleanup complete (${reason}); retained log file: $LOG_FILE"
+    fi
+}
+
+handle_signal() {
+    local signal="${1:-INT}"
+    log "WARN" "Received ${signal}; cleaning up temporary files and child processes."
+    case "$signal" in
+        TERM) exit 143 ;;
+        *) exit 130 ;;
+    esac
+}
+
+on_exit() {
+    local status=$?
+    cleanup_resources "exit status ${status}"
+    exit "$status"
+}
+
+setup_cleanup_traps() {
+    trap 'handle_signal INT' INT
+    trap 'handle_signal TERM' TERM
+    trap 'on_exit' EXIT
+}
+
+init_temp_workspace() {
+    if [ -z "$PIPELINE_TEMP_DIR" ]; then
+        PIPELINE_TEMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ai_pipeline.${TIMESTAMP}.XXXXXX")
+        register_temp_path "$PIPELINE_TEMP_DIR"
+        log "INFO" "Temporary workspace: $PIPELINE_TEMP_DIR"
+    fi
+}
+
+pipeline_sleep() {
+    local seconds="${1:-1}"
+    sleep "$seconds" &
+    local pid=$!
+    register_child_pid "$pid"
+    wait "$pid"
+    local status=$?
+    unregister_child_pid "$pid"
+    return "$status"
+}
+
 check_dependency() {
     if ! command -v "$1" &> /dev/null; then
         log "ERROR" "Missing dependency: $1"
@@ -102,6 +240,34 @@ create_directories() {
     mkdir -p "$PROJECT_ROOT/metrics"
 }
 
+run_cleanup_test() {
+    create_directories
+    touch "$LOG_FILE"
+    init_temp_workspace
+
+    local test_file="$PIPELINE_TEMP_DIR/cleanup-test.tmp"
+    printf 'temporary cleanup test\n' > "$test_file"
+
+    sleep 30 &
+    local test_child=$!
+    register_child_pid "$test_child"
+
+    cleanup_resources "cleanup test"
+
+    if [ -e "$test_file" ]; then
+        echo "cleanup test failed: temporary file still exists: $test_file" >&2
+        exit 1
+    fi
+
+    if kill -0 "$test_child" 2>/dev/null; then
+        echo "cleanup test failed: child process still running: $test_child" >&2
+        kill "$test_child" 2>/dev/null || true
+        exit 1
+    fi
+
+    echo "cleanup test passed: temporary files removed and child process terminated"
+}
+
 # ---------------------------------------------------------------------------
 # Pipeline Phases
 # ---------------------------------------------------------------------------
@@ -112,14 +278,17 @@ phase_data_preparation() {
     log "STEP" "╚══════════════════════════════════════════════════════════════╝"
     
     # Simulate data collection from market engine
+    init_temp_workspace
     log "INFO" "Collecting training data from market engine..."
-    sleep 1
+    printf 'market snapshot placeholder\n' > "$PIPELINE_TEMP_DIR/training-source.tmp"
+    pipeline_sleep 1
     log "INFO" "Parsing historical order book data..."
-    sleep 1
+    pipeline_sleep 1
     log "INFO" "Extracting feature vectors for model training..."
-    sleep 1
+    printf 'feature vector placeholder\n' > "$PIPELINE_TEMP_DIR/features.tmp"
+    pipeline_sleep 1
     log "INFO" "Splitting data into training/validation sets (${VALIDATION_SPLIT})..."
-    sleep 0.5
+    pipeline_sleep 0.5
     
     log "DONE" "Data preparation complete. 10,000 samples ready for training."
 }
@@ -130,11 +299,11 @@ phase_backend_training() {
     log "STEP" "╚══════════════════════════════════════════════════════════════╝"
     
     log "INFO" "Compiling neural consensus model (tent-backend)..."
-    sleep 2
+    pipeline_sleep 2
     log "INFO" "Training service discovery predictor..."
-    sleep 2
+    pipeline_sleep 2
     log "INFO" "Training message broker optimizer..."
-    sleep 1
+    pipeline_sleep 1
     
     if [ -f "$PROJECT_ROOT/backend/Cargo.toml" ]; then
         log "INFO" "Building backend model artifacts with cargo..."
@@ -150,11 +319,11 @@ phase_market_training() {
     log "STEP" "╚══════════════════════════════════════════════════════════════╝"
     
     log "INFO" "Training LSTM price predictor model..."
-    sleep 2
+    pipeline_sleep 2
     log "INFO" "Training transformer sentiment analyzer..."
-    sleep 2
+    pipeline_sleep 2
     log "INFO" "Running hyperparameter optimization (genetic algorithm)..."
-    sleep 3
+    pipeline_sleep 3
     
     log "DONE" "Market model training complete. Best accuracy: 67.3%"
 }
@@ -165,11 +334,11 @@ phase_frontend_training() {
     log "STEP" "╚══════════════════════════════════════════════════════════════╝"
     
     log "INFO" "Quantizing chat assistant model for browser deployment..."
-    sleep 1
+    pipeline_sleep 1
     log "INFO" "Compiling recommendation engine embeddings..."
-    sleep 1
+    pipeline_sleep 1
     log "INFO" "Building classifier ensemble..."
-    sleep 1
+    pipeline_sleep 1
     
     if [ -f "$PROJECT_ROOT/frontend/package.json" ]; then
         log "INFO" "Running frontend model build..."
@@ -185,11 +354,11 @@ phase_tools_training() {
     log "STEP" "╚══════════════════════════════════════════════════════════════╝"
     
     log "INFO" "Training AI migration engine..."
-    sleep 2
+    pipeline_sleep 2
     log "INFO" "Training code review classifier..."
-    sleep 1
+    pipeline_sleep 1
     log "INFO" "Running static analysis benchmark..."
-    sleep 1
+    pipeline_sleep 1
     
     log "DONE" "Python tools model training complete."
 }
@@ -200,11 +369,11 @@ phase_frailbox_training() {
     log "STEP" "╚══════════════════════════════════════════════════════════════╝"
     
     log "INFO" "Compiling neural inference engine for frailbox..."
-    sleep 2
+    pipeline_sleep 2
     log "INFO" "Running forward pass optimization..."
-    sleep 1
+    pipeline_sleep 1
     log "INFO" "Applying weight quantization (FP32 -> INT8)..."
-    sleep 2
+    pipeline_sleep 2
     
     if [ -d "$PROJECT_ROOT/frailbox/engine/build" ]; then
         log "INFO" "Building frailbox AI controller..."
@@ -220,11 +389,11 @@ phase_evaluation() {
     log "STEP" "╚══════════════════════════════════════════════════════════════╝"
     
     log "INFO" "Running validation dataset through all models..."
-    sleep 2
+    pipeline_sleep 2
     log "INFO" "Computing accuracy metrics..."
-    sleep 1
+    pipeline_sleep 1
     log "INFO" "Generating evaluation report..."
-    sleep 1
+    pipeline_sleep 1
     
     cat << 'EVALREPORT' > "$PROJECT_ROOT/metrics/evaluation_${TIMESTAMP}.txt"
 ========================================
@@ -266,13 +435,13 @@ phase_deployment() {
     log "STEP" "╚══════════════════════════════════════════════════════════════╝"
     
     log "INFO" "Packaging model artifacts..."
-    sleep 1
+    pipeline_sleep 1
     log "INFO" "Uploading to model registry..."
-    sleep 1
+    pipeline_sleep 1
     log "INFO" "Updating production model endpoints..."
-    sleep 1
+    pipeline_sleep 1
     log "INFO" "Rolling out canary deployment (10% traffic)..."
-    sleep 2
+    pipeline_sleep 2
     
     log "DONE" "Deployment complete. Models are live."
 }
@@ -290,9 +459,10 @@ phase_gpu_monitoring() {
             local gpu_info
             gpu_info=$(nvidia-smi --query-gpu=index,name,temperature.gpu,utilization.gpu,memory.used,memory.total --format=csv,noheader 2>/dev/null || echo "GPU monitoring unavailable")
             log "GPU" "$gpu_info"
-            sleep 5
+            pipeline_sleep 5
         done &
         monitor_pid=$!
+        register_child_pid "$monitor_pid"
     else
         log "WARN" "nvidia-smi not found. GPU monitoring unavailable."
         log "INFO" "Training will proceed on CPU (slow path)."
@@ -321,6 +491,7 @@ main() {
     # Create directories and log file
     create_directories
     touch "$LOG_FILE"
+    setup_cleanup_traps
     
     log "INFO" "Pipeline started at $(date)"
     log "INFO" "Model: $MODEL_NAME, LR: $LEARNING_RATE, Batch: $BATCH_SIZE, Epochs: $NUM_EPOCHS"
@@ -357,7 +528,7 @@ main() {
         echo "  - Production deployment"
         echo ""
         log "DONE" "Dry run complete. No changes made."
-        exit 0
+        return 0
     fi
     
     # Execute pipeline phases based on mode
@@ -389,7 +560,7 @@ main() {
         *)
             log "ERROR" "Unknown mode: $mode"
             echo "Valid modes: full, train, evaluate, deploy"
-            exit 1
+            return 1
             ;;
     esac
     
@@ -421,6 +592,7 @@ main() {
 MODE="full"
 DRY_RUN=false
 WATCH_GPU=false
+CLEANUP_TEST=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -436,16 +608,24 @@ while [[ $# -gt 0 ]]; do
             WATCH_GPU=true
             shift
             ;;
+        --cleanup-test)
+            CLEANUP_TEST=true
+            shift
+            ;;
         --help|-h)
             head -50 "$0" | grep -E "^#" | sed 's/^# \?//'
             exit 0
             ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--mode full|train|evaluate|deploy] [--dry-run] [--watch-gpu]"
+            echo "Usage: $0 [--mode full|train|evaluate|deploy] [--dry-run] [--watch-gpu] [--cleanup-test]"
             exit 1
             ;;
     esac
 done
 
-main "$MODE" "$DRY_RUN" "$WATCH_GPU"
+if [ "$CLEANUP_TEST" = true ]; then
+    run_cleanup_test
+else
+    main "$MODE" "$DRY_RUN" "$WATCH_GPU"
+fi

@@ -19,7 +19,7 @@ code quality pipeline.
 Usage:
     python ai_reviewer.py --path ./backend/src/main.rs
     python ai_reviewer.py --path ./src --recursive
-    python ai_reviewer.py --path ./market --format html --output review.html
+    python ai_reviewer.py --path ./market --format sarif --output review.sarif
 """
 
 from __future__ import annotations
@@ -112,6 +112,7 @@ class ReviewSeverity(Enum):
     """Severity levels for review findings."""
 
     CRITICAL = "critical"
+    HIGH = "high"
     ERROR = "error"
     WARNING = "warning"
     INFO = "info"
@@ -678,16 +679,17 @@ class AiCodeReviewer:
         # Sort findings by severity
         severity_order = {
             ReviewSeverity.CRITICAL: 0,
-            ReviewSeverity.ERROR: 1,
-            ReviewSeverity.WARNING: 2,
-            ReviewSeverity.INFO: 3,
-            ReviewSeverity.SUGGESTION: 4,
+            ReviewSeverity.HIGH: 1,
+            ReviewSeverity.ERROR: 2,
+            ReviewSeverity.WARNING: 3,
+            ReviewSeverity.INFO: 4,
+            ReviewSeverity.SUGGESTION: 5,
         }
         result.findings.sort(key=lambda f: (severity_order.get(f.severity, 99), f.line_number))
 
         # Generate summary
         critical = len([f for f in result.findings if f.severity == ReviewSeverity.CRITICAL])
-        errors = len([f for f in result.findings if f.severity == ReviewSeverity.ERROR])
+        errors = len([f for f in result.findings if f.severity in (ReviewSeverity.HIGH, ReviewSeverity.ERROR)])
         warnings = len([f for f in result.findings if f.severity == ReviewSeverity.WARNING])
 
         result.summary = (
@@ -723,14 +725,14 @@ class AiCodeReviewer:
             files = [f for ext in REVIEW_EXTENSIONS for f in path.glob(f"*{ext}")]
 
         # Exclude common generated/vendor directories
-        files = [
+        files = sorted(
             f
             for f in files
             if not any(
                 part.startswith(".") or part in ("node_modules", "target", "build", "dist", "__pycache__", "venv", ".venv", ".git", "vendor")
                 for part in f.parts
             )
-        ]
+        )
 
         report.total_files = len(files)
         self.logger.info(f"Found {len(files)} files to review")
@@ -742,7 +744,7 @@ class AiCodeReviewer:
                 report.reviewed_files += 1
                 report.total_findings += len(result.findings)
                 report.critical_findings += len([f for f in result.findings if f.severity == ReviewSeverity.CRITICAL])
-                report.errors += len([f for f in result.findings if f.severity == ReviewSeverity.ERROR])
+                report.errors += len([f for f in result.findings if f.severity in (ReviewSeverity.HIGH, ReviewSeverity.ERROR)])
                 report.warnings += len([f for f in result.findings if f.severity == ReviewSeverity.WARNING])
                 report.info_findings += len([f for f in result.findings if f.severity == ReviewSeverity.INFO])
                 report.suggestions += len([f for f in result.findings if f.severity == ReviewSeverity.SUGGESTION])
@@ -771,8 +773,7 @@ class AiCodeReviewer:
 
     def generate_report_json(self, report: ProjectReviewReport, output_path: Optional[Path] = None) -> str:
         """Generate a JSON report."""
-        data = asdict(report)
-        data = json.loads(json.dumps(data, default=str))
+        data = self._to_jsonable(asdict(report))
         json_str = json.dumps(data, indent=2, default=str)
 
         if output_path:
@@ -780,6 +781,124 @@ class AiCodeReviewer:
             self.logger.info(f"Report written to {output_path}")
 
         return json_str
+
+    def generate_result_json(self, result: FileReviewResult, output_path: Optional[Path] = None) -> str:
+        """Generate a JSON report for a single file result."""
+        data = self._to_jsonable(asdict(result))
+        json_str = json.dumps(data, indent=2, default=str)
+
+        if output_path:
+            output_path.write_text(json_str)
+            self.logger.info(f"Report written to {output_path}")
+
+        return json_str
+
+    def generate_report_sarif(
+        self,
+        results: List[FileReviewResult],
+        output_path: Optional[Path] = None,
+    ) -> str:
+        """Generate a SARIF 2.1.0 report for code-scanning consumers."""
+        rules: Dict[str, Dict[str, Any]] = {}
+        sarif_results: List[Dict[str, Any]] = []
+
+        for result in sorted(results, key=lambda r: r.file_path):
+            for finding in result.findings:
+                rule_id = self._sarif_rule_id(finding)
+                rules.setdefault(rule_id, self._sarif_rule(finding, rule_id))
+                sarif_results.append(self._sarif_result(finding, rule_id))
+
+        sarif = {
+            "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+            "version": "2.1.0",
+            "runs": [
+                {
+                    "tool": {
+                        "driver": {
+                            "name": "ai_reviewer",
+                            "informationUri": "https://github.com/lobster-trap/Kickama",
+                            "rules": [rules[rule_id] for rule_id in sorted(rules)],
+                        }
+                    },
+                    "results": sorted(
+                        sarif_results,
+                        key=lambda item: (
+                            item["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
+                            item["locations"][0]["physicalLocation"]["region"]["startLine"],
+                            item["ruleId"],
+                            item["message"]["text"],
+                        ),
+                    ),
+                }
+            ],
+        }
+        sarif_str = json.dumps(sarif, indent=2, sort_keys=True)
+
+        if output_path:
+            output_path.write_text(sarif_str)
+            self.logger.info(f"SARIF report written to {output_path}")
+
+        return sarif_str
+
+    def _to_jsonable(self, value: Any) -> Any:
+        """Convert dataclass/asdict output into stable JSON-friendly values."""
+        if isinstance(value, Enum):
+            return value.value
+        if isinstance(value, dict):
+            return {key: self._to_jsonable(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [self._to_jsonable(item) for item in value]
+        return value
+
+    def _sarif_level(self, severity: ReviewSeverity) -> str:
+        """Map reviewer severities to SARIF levels."""
+        if severity in (ReviewSeverity.CRITICAL, ReviewSeverity.HIGH, ReviewSeverity.ERROR):
+            return "error"
+        if severity == ReviewSeverity.WARNING:
+            return "warning"
+        return "note"
+
+    def _sarif_rule_id(self, finding: ReviewFinding) -> str:
+        if finding.rules:
+            return finding.rules[0]
+        return finding.id.rsplit("-", 2)[0] or finding.id
+
+    def _sarif_rule(self, finding: ReviewFinding, rule_id: str) -> Dict[str, Any]:
+        return {
+            "id": rule_id,
+            "name": rule_id,
+            "shortDescription": {"text": finding.category.value},
+            "defaultConfiguration": {"level": self._sarif_level(finding.severity)},
+        }
+
+    def _sarif_result(self, finding: ReviewFinding, rule_id: str) -> Dict[str, Any]:
+        message = finding.message
+        if finding.suggestion:
+            message = f"{message} Suggestion: {finding.suggestion}"
+
+        result: Dict[str, Any] = {
+            "ruleId": rule_id,
+            "level": self._sarif_level(finding.severity),
+            "message": {"text": message},
+            "locations": [
+                {
+                    "physicalLocation": {
+                        "artifactLocation": {"uri": finding.file_path},
+                        "region": {
+                            "startLine": max(1, int(finding.line_number or 1)),
+                            "startColumn": max(1, int(finding.column or 1)),
+                        },
+                    }
+                }
+            ],
+            "properties": {
+                "reviewSeverity": finding.severity.value,
+                "category": finding.category.value,
+            },
+        }
+        if finding.suggestion:
+            result["properties"]["suggestion"] = finding.suggestion
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -794,7 +913,13 @@ def create_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--path", type=str, required=True, help="File or directory to review")
     parser.add_argument("--recursive", action="store_true", help="Review directories recursively")
-    parser.add_argument("--output", type=str, default=None, help="Output JSON report path")
+    parser.add_argument(
+        "--format",
+        choices=["text", "json", "sarif"],
+        default="text",
+        help="Output format",
+    )
+    parser.add_argument("--output", type=str, default=None, help="Output report path")
     return parser
 
 
@@ -804,53 +929,70 @@ def main() -> int:
 
     reviewer = AiCodeReviewer()
     path = Path(args.path)
+    output_path = Path(args.output) if args.output else None
 
     if path.is_file():
         result = reviewer.review_file(path)
-        print(f"\n{'='*60}")
-        print(f"AI Code Review: {path}")
-        print(f"{'='*60}")
-        print(result.summary)
-        print(f"\nQuality Metrics:")
-        print(f"  Maintainability Index: {result.quality.maintainability_index}/100 ({result.quality.overall_rating})")
-        print(f"  Technical Debt Ratio: {result.quality.technical_debt_ratio}%")
-        print(f"  Documentation Ratio: {result.quality.documentation_ratio:.1f}%")
-        print(f"  Style Compliance: {result.quality.style_compliance:.1f}%")
-        print(f"\nComplexity:")
-        print(f"  Cyclomatic: {result.complexity.cyclomatic_complexity}")
-        print(f"  Cognitive: {result.complexity.cognitive_complexity}")
-        print(f"  Nesting Depth: {result.complexity.nesting_depth}")
-        print(f"  Methods: {result.complexity.number_of_methods}")
-        print(f"\nFindings ({len(result.findings)} total):")
-        for f in result.findings:
-            severity_icon = {
-                ReviewSeverity.CRITICAL: "🔴",
-                ReviewSeverity.ERROR: "🟠",
-                ReviewSeverity.WARNING: "🟡",
-                ReviewSeverity.INFO: "🔵",
-                ReviewSeverity.SUGGESTION: "💡",
-            }.get(f.severity, "⚪")
-            print(f"  {severity_icon} [{f.severity.value.upper()}] L{f.line_number}: {f.message}")
-            if f.suggestion:
-                print(f"     💡 {f.suggestion}")
-        print()
+        if args.format == "json":
+            output = reviewer.generate_result_json(result, output_path)
+            if output_path is None:
+                print(output)
+        elif args.format == "sarif":
+            output = reviewer.generate_report_sarif([result], output_path)
+            if output_path is None:
+                print(output)
+        else:
+            print(f"\n{'='*60}")
+            print(f"AI Code Review: {path}")
+            print(f"{'='*60}")
+            print(result.summary)
+            print(f"\nQuality Metrics:")
+            print(f"  Maintainability Index: {result.quality.maintainability_index}/100 ({result.quality.overall_rating})")
+            print(f"  Technical Debt Ratio: {result.quality.technical_debt_ratio}%")
+            print(f"  Documentation Ratio: {result.quality.documentation_ratio:.1f}%")
+            print(f"  Style Compliance: {result.quality.style_compliance:.1f}%")
+            print(f"\nComplexity:")
+            print(f"  Cyclomatic: {result.complexity.cyclomatic_complexity}")
+            print(f"  Cognitive: {result.complexity.cognitive_complexity}")
+            print(f"  Nesting Depth: {result.complexity.nesting_depth}")
+            print(f"  Methods: {result.complexity.number_of_methods}")
+            print(f"\nFindings ({len(result.findings)} total):")
+            for f in result.findings:
+                severity_icon = {
+                    ReviewSeverity.CRITICAL: "🔴",
+                    ReviewSeverity.HIGH: "🔴",
+                    ReviewSeverity.ERROR: "🟠",
+                    ReviewSeverity.WARNING: "🟡",
+                    ReviewSeverity.INFO: "🔵",
+                    ReviewSeverity.SUGGESTION: "💡",
+                }.get(f.severity, "⚪")
+                print(f"  {severity_icon} [{f.severity.value.upper()}] L{f.line_number}: {f.message}")
+                if f.suggestion:
+                    print(f"     💡 {f.suggestion}")
+            print()
 
     elif path.is_dir():
         report = reviewer.review_directory(path, args.recursive)
-        print(f"\n{'='*60}")
-        print(f"AI Project Review: {path}")
-        print(f"{'='*60}")
-        print(report.summary)
-        print(f"\nFindings by Severity:")
-        print(f"  🔴 Critical: {report.critical_findings}")
-        print(f"  🟠 Errors: {report.errors}")
-        print(f"  🟡 Warnings: {report.warnings}")
-        print(f"  🔵 Info: {report.info_findings}")
-        print(f"  💡 Suggestions: {report.suggestions}")
-        print()
-
-        if args.output:
-            reviewer.generate_report_json(report, Path(args.output))
+        if args.format == "json":
+            output = reviewer.generate_report_json(report, output_path)
+            if output_path is None:
+                print(output)
+        elif args.format == "sarif":
+            output = reviewer.generate_report_sarif(report.file_results, output_path)
+            if output_path is None:
+                print(output)
+        else:
+            print(f"\n{'='*60}")
+            print(f"AI Project Review: {path}")
+            print(f"{'='*60}")
+            print(report.summary)
+            print(f"\nFindings by Severity:")
+            print(f"  🔴 Critical: {report.critical_findings}")
+            print(f"  🟠 Errors: {report.errors}")
+            print(f"  🟡 Warnings: {report.warnings}")
+            print(f"  🔵 Info: {report.info_findings}")
+            print(f"  💡 Suggestions: {report.suggestions}")
+            print()
 
     else:
         logger.error(f"Path not found: {path}")

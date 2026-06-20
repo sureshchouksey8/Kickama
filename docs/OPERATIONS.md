@@ -245,6 +245,27 @@ for seasonality or business cycles.
 
 ## Security
 
+### AI Reviewer SARIF Export
+
+`tools/ai_reviewer.py` can emit GitHub code-scanning compatible SARIF for a
+single file or a recursive directory review:
+
+```bash
+python3 tools/ai_reviewer.py --path backend/src/main.rs --format sarif --output review.sarif
+python3 tools/ai_reviewer.py --path market --recursive --format sarif --output market-review.sarif
+```
+
+Use `--format text` for the default console report and `--format json` for the
+native reviewer data model. SARIF results include the file path, line number,
+rule id, message, reviewer severity, category, and suggestion when one is
+available. Reviewer severities map to SARIF levels as follows:
+
+| Reviewer severity | SARIF level |
+|-------------------|-------------|
+| `critical`, `high`, `error` | `error` |
+| `warning` | `warning` |
+| `info`, `suggestion` | `note` |
+
 ### Access Control
 
 | Role | Access Level | MFA Required | Approval Required |

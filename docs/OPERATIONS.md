@@ -281,6 +281,7 @@ To verify cleanup behavior without external services:
 
 ```bash
 ./ai_pipeline.sh --cleanup-test
+tests/check-ai-pipeline-cleanup.sh
 ```
 
 The cleanup test creates a temporary file and a managed child process, runs the

@@ -116,6 +116,15 @@ class ImportResult:
     results: List[Dict[str, Any]] = field(default_factory=list)
     duration_seconds: float = 0.0
 
+SECRET_VALUE_PATTERN = re.compile(
+    r"(secret|token|password|passwd|credential|private|access[_-]?key|client[_-]?secret|api[_-]?key)",
+    re.IGNORECASE,
+)
+
+SENSITIVE_ID_PATTERN = re.compile(
+    r"(?i)(AKIA[0-9A-Z]{16}|ASIA[0-9A-Z]{16}|-----BEGIN [A-Z ]*PRIVATE KEY-----|[A-Za-z0-9_=-]{32,})"
+)
+
 # ---------------------------------------------------------------------------
 # IMPORTER
 # ---------------------------------------------------------------------------
@@ -275,6 +284,49 @@ class TerraformImporter:
         os.chmod(output_file, 0o755)
         logger.info(f"Import script written to {output_file}")
         return script
+
+    def build_import_plan_summary(
+        self,
+        resources: List[ResourceToImport],
+        state_resources: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        existing = set(state_resources if state_resources is not None else self.list_resources_in_state())
+        summary = []
+
+        for resource in sorted(resources, key=lambda item: self._resource_address(item)):
+            address = self._resource_address(resource)
+            summary.append({
+                "address": address,
+                "provider_type": resource.resource_type,
+                "import_id": redact_secret_value(resource.resource_id),
+                "already_imported": address in existing,
+                "state_file": resource.state_file,
+            })
+
+        return summary
+
+    def write_import_plan_summary(
+        self,
+        resources: List[ResourceToImport],
+        output_file: str,
+        output_format: str = "json",
+        state_resources: Optional[List[str]] = None,
+    ) -> str:
+        summary = self.build_import_plan_summary(resources, state_resources=state_resources)
+        if output_format == "json":
+            rendered = json.dumps(summary, indent=2, sort_keys=True) + "\n"
+        else:
+            rendered = render_plan_summary_text(summary)
+
+        with open(output_file, "w") as f:
+            f.write(rendered)
+
+        logger.info(f"Import plan summary written to {output_file}")
+        return rendered
+
+    @staticmethod
+    def _resource_address(resource: ResourceToImport) -> str:
+        return resource.terraform_address or f"{resource.resource_type}.{resource.resource_name}"
 
     def validate_state(self) -> bool:
         try:
@@ -436,12 +488,66 @@ def parse_args():
     parser.add_argument("--workers", type=int, default=4, help="Number of parallel workers")
     parser.add_argument("--csv", help="CSV file with resources to import (type,name,id)")
     parser.add_argument("--generate-script", help="Generate shell script instead of importing")
+    parser.add_argument("--plan-summary", help="Write a deterministic import plan summary to this path")
+    parser.add_argument(
+        "--format",
+        choices=("text", "json"),
+        default="text",
+        help="Output format for --plan-summary (default: text)",
+    )
     parser.add_argument("--validate", action="store_true", help="Validate Terraform configuration")
     parser.add_argument("--plan", action="store_true", help="Generate Terraform plan")
     parser.add_argument("--detect-unmanaged", action="store_true", help="Detect unmanaged AWS resources")
     parser.add_argument("--list-state", action="store_true", help="List all resources in Terraform state")
     parser.add_argument("--verbose", "-v", action="store_true", help="Enable verbose output")
     return parser.parse_args()
+
+
+def redact_secret_value(value: str) -> str:
+    if not value:
+        return value
+
+    if "=" in value:
+        key, raw = value.split("=", 1)
+        if SECRET_VALUE_PATTERN.search(key):
+            return f"{key}=<redacted>"
+        value = raw
+
+    if SECRET_VALUE_PATTERN.search(value) or SENSITIVE_ID_PATTERN.search(value):
+        if len(value) <= 8:
+            return "<redacted>"
+        return f"{value[:4]}...{value[-4:]}<redacted>"
+
+    return value
+
+
+def render_plan_summary_text(summary: List[Dict[str, Any]]) -> str:
+    lines = ["Terraform import plan summary", ""]
+    for item in summary:
+        status = "already imported" if item["already_imported"] else "pending import"
+        lines.append(f"- {item['address']} [{status}]")
+        lines.append(f"  provider_type: {item['provider_type']}")
+        lines.append(f"  import_id: {item['import_id']}")
+        lines.append(f"  state_file: {item['state_file']}")
+    return "\n".join(lines) + "\n"
+
+
+def load_resources_from_csv(path: str) -> List[ResourceToImport]:
+    resources_to_import = []
+    with open(path, "r") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            resource_type = row.get("type", row.get("resource_type", ""))
+            resource_name = row.get("name", row.get("resource_name", ""))
+            terraform_address = row.get("address", row.get("terraform_address", ""))
+            resources_to_import.append(ResourceToImport(
+                resource_type=resource_type,
+                resource_name=resource_name,
+                resource_id=row.get("id", row.get("resource_id", "")),
+                terraform_address=terraform_address,
+                state_file=row.get("state_file", "terraform.tfstate"),
+            ))
+    return resources_to_import
 
 
 def main():
@@ -454,7 +560,9 @@ def main():
         terraform_binary=args.terraform_bin,
     )
 
-    if not importer.check_terraform_version():
+    terraform_required = not (args.csv and args.plan_summary and not args.validate and not args.plan and not args.list_state and not args.detect_unmanaged)
+
+    if terraform_required and not importer.check_terraform_version():
         logger.error("Terraform not found or incompatible version")
         return 1
 
@@ -491,16 +599,7 @@ def main():
             logger.info("No unmanaged resources found")
 
     if args.csv:
-        resources_to_import = []
-        with open(args.csv, "r") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                resources_to_import.append(ResourceToImport(
-                    resource_type=row.get("type", row.get("resource_type", "")),
-                    resource_name=row.get("name", row.get("resource_name", "")),
-                    resource_id=row.get("id", row.get("resource_id", "")),
-                    state_file=row.get("state_file", "terraform.tfstate"),
-                ))
+        resources_to_import = load_resources_from_csv(args.csv)
 
         if not resources_to_import:
             logger.error("No resources found in CSV file")
@@ -508,8 +607,20 @@ def main():
 
         logger.info(f"Loaded {len(resources_to_import)} resources from {args.csv}")
 
+        if args.plan_summary:
+            importer.write_import_plan_summary(
+                resources_to_import,
+                args.plan_summary,
+                output_format=args.format,
+                state_resources=[] if not terraform_required else None,
+            )
+            if not args.generate_script and args.dry_run:
+                return 0
+
         if args.generate_script:
             importer.generate_import_script(resources_to_import, args.generate_script)
+        elif args.plan_summary and not terraform_required:
+            return 0
         else:
             result = importer.import_batch(
                 resources_to_import,

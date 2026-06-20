@@ -13,6 +13,29 @@
 > The known issues from the migration are tracked in the "K8s Migration Known
 > Issues" spreadsheet which is linked from the team's shared drive.
 
+## Terraform Import Planning
+
+Use `tools/terraform_import.py --plan-summary` to review legacy Terraform
+imports before running any import command. The summary is deterministic and
+includes the Terraform address, provider type, redacted import ID, state file,
+and whether the address is already present in state.
+
+Generate a JSON summary from a CSV import list without contacting Terraform:
+
+```bash
+python3 tools/terraform_import.py --csv imports.csv --plan-summary import-plan.json --format json
+```
+
+Generate a human-readable summary:
+
+```bash
+python3 tools/terraform_import.py --csv imports.csv --plan-summary import-plan.txt
+```
+
+CSV rows may include `type,name,id,state_file` or an explicit
+`address`/`terraform_address` for module resources. Secret-looking import IDs,
+tokens, passwords, access keys, and client secrets are redacted in summaries.
+
 ## Monitoring
 
 ### Health Check Endpoints
